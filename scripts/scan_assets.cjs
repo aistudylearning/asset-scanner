@@ -80,7 +80,10 @@ function generateAssets() {
     const exchange = nyseStocks.has(sym) ? 'NYSE' : 'NASDAQ';
     assets.push({ name: sym, symbol: sym, tvSymbol: `${exchange}:${sym}` });
   });
-  cnTickers.forEach(sym => assets.push({ name: sym.replace('.HK', ''), symbol: sym,        tvSymbol: `HKEX:${sym.replace('.HK', '')}` }));
+  cnTickers.forEach(sym => {
+    const ticker = sym.replace('.HK', '').replace(/^0+/, ''); // Remove leading zeros
+    assets.push({ name: sym.replace('.HK', ''), symbol: sym, tvSymbol: `HKEX:${ticker}` });
+  });
   inTickers.forEach(sym => assets.push({ name: sym.replace('.NS', ''), symbol: sym,        tvSymbol: `NSE:${sym.replace('.NS', '')}` }));
   vnTickers.forEach(sym => assets.push({ name: sym.replace('.HM', ''), symbol: sym,        tvSymbol: `HOSE:${sym.replace('.HM', '')}` }));
   return assets;
