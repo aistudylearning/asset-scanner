@@ -1,34 +1,24 @@
-const https = require('https'); const fs = require('fs');
+const https = require('https'); 
+const fs = require('fs');
 const { execSync } = require('child_process');
+const { RSI, BollingerBands, MACD, OBV, VWAP } = require('technicalindicators');
 
 const EMAIL_TO = 'ai.study.learning@gmail.com';
-const GOG_SCRIPT = 'D:\\dev\\OpenClaw\\config\\.openclaw\\workspace\\skills\\gog\\scripts\\send.js';
-
 const delay = ms => new Promise(res => setTimeout(res, ms));
 
-// ─── Scoring thresholds ────────────────────────────────────────────────────
-// Score breakdown (max 10):
-//   TA  – RSI < 25 (+1), Bollinger squeeze (+1), MACD bullish cross (+1)
-//   Vol – OBV rising (+2), price below VWAP (+1)
-//   FA  – DXY falling (+1, commodities only), CPI high + rates low (+1, commodities only)
-//         Reddit mention spike (+2, stocks/crypto — requires PRAW, disabled by default)
-//
-// Score ≥ 4 → email · Score 3 → log only · Score 1-2 → skip
-
 const SCORE_EMAIL_THRESHOLD = 4;
-const SCORE_LOG_THRESHOLD   = 3;
+const SCORE_LOG_THRESHOLD = 3;
 const RSI_OVERSOLD = 25;
 
-// ─── Asset lists ──────────────────────────────────────────────────────────
-
+// Asset lists (commodities, US, China, India, Vietnam)
 const commodities = [
-  { name: 'Gold',                symbol: 'GC=F',  tvSymbol: 'COMEX:GC1!',  isCommodity: true },
-  { name: 'Silver',              symbol: 'SI=F',  tvSymbol: 'COMEX:SI1!',  isCommodity: true },
-  { name: 'Copper (Bronze proxy)',symbol: 'HG=F',  tvSymbol: 'COMEX:HG1!',  isCommodity: true },
-  { name: 'Platinum',            symbol: 'PL=F',  tvSymbol: 'NYMEX:PL1!',  isCommodity: true },
-  { name: 'Palladium',           symbol: 'PA=F',  tvSymbol: 'NYMEX:PA1!',  isCommodity: true },
-  { name: 'Rare Earth ETF',      symbol: 'REMX',  tvSymbol: 'AMEX:REMX',   isCommodity: true },
-  { name: 'Uranium ETF',         symbol: 'URA',   tvSymbol: 'AMEX:URA',    isCommodity: true },
+  { name: 'Gold', symbol: 'GC=F', tvSymbol: 'COMEX:GC1!', isCommodity: true },
+  { name: 'Silver', symbol: 'SI=F', tvSymbol: 'COMEX:SI1!', isCommodity: true },
+  { name: 'Copper (Bronze proxy)', symbol: 'HG=F', tvSymbol: 'COMEX:HG1!', isCommodity: true },
+  { name: 'Platinum', symbol: 'PL=F', tvSymbol: 'NYMEX:PL1!', isCommodity: true },
+  { name: 'Palladium', symbol: 'PA=F', tvSymbol: 'NYMEX:PA1!', isCommodity: true },
+  { name: 'Rare Earth ETF', symbol: 'REMX', tvSymbol: 'AMEX:REMX', isCommodity: true },
+  { name: 'Uranium ETF', symbol: 'URA', tvSymbol: 'AMEX:URA', isCommodity: true },
 ];
 
 const usTickers = [
@@ -66,7 +56,6 @@ const vnTickers = [
   "SSB.HM","SHB.HM","TPB.HM","BVH.HM","POW.HM","GVR.HM","BCM.HM","VJC.HM","PLX.HM","SSI.HM"
 ];
 
-// US stock exchange mapping (NYSE vs NASDAQ)
 const nyseStocks = new Set([
   "JPM","WMT","UNH","V","MA","JNJ","PG","HD","ABBV","MRK","BAC","KO","CVX","PEP","LIN",
   "TMO","WFC","MCD","DIS","ABT","IBM","TXN","PM","CAT","COP","BA","SPGI","GE","HON",
@@ -81,17 +70,15 @@ function generateAssets() {
     assets.push({ name: sym, symbol: sym, tvSymbol: `${exchange}:${sym}` });
   });
   cnTickers.forEach(sym => {
-    const ticker = sym.replace('.HK', '').replace(/^0+/, ''); // Remove leading zeros
+    const ticker = sym.replace('.HK', '').replace(/^0+/, '');
     assets.push({ name: sym.replace('.HK', ''), symbol: sym, tvSymbol: `HKEX:${ticker}` });
   });
-  inTickers.forEach(sym => assets.push({ name: sym.replace('.NS', ''), symbol: sym,        tvSymbol: `NSE:${sym.replace('.NS', '')}` }));
-  vnTickers.forEach(sym => assets.push({ name: sym.replace('.HM', ''), symbol: sym,        tvSymbol: `HOSE:${sym.replace('.HM', '')}` }));
+  inTickers.forEach(sym => assets.push({ name: sym.replace('.NS', ''), symbol: sym, tvSymbol: `NSE:${sym.replace('.NS', '')}` }));
+  vnTickers.forEach(sym => assets.push({ name: sym.replace('.HM', ''), symbol: sym, tvSymbol: `HOSE:${sym.replace('.HM', '')}` }));
   return assets;
 }
 
 const ALL_ASSETS = generateAssets();
-
-// ─── HTTP helper ──────────────────────────────────────────────────────────
 
 function fetchJson(url) {
   return new Promise((resolve, reject) => {
@@ -102,35 +89,20 @@ function fetchJson(url) {
         try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
       });
     });
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new Error('Request timed out'));
-    });
+    req.on('timeout', () => { req.destroy(); reject(new Error('Request timed out')); });
     req.on('error', reject);
   });
 }
-
-// ─── Macro data (FRED) ────────────────────────────────────────────────────
-// Free public API — no key needed for public series.
-// DXY proxy: DTWEXBGS (Trade Weighted USD Index, Broad)
-// CPI:       CPIAUCSL (monthly)
-// Fed Funds: FEDFUNDS (monthly)
-//
-// Cached once per run so we don't hammer FRED for every commodity.
 
 let macroCache = null;
 
 async function fetchMacroSignals() {
   if (macroCache) return macroCache;
 
-  const base = 'https://fred.stlouisfed.org/graph/fredgraph.json?vintage_date=';
-  const today = new Date().toISOString().slice(0, 10);
-
   async function fetchSeries(series, limit = 3) {
     try {
       const url = `https://fred.stlouisfed.org/graph/fredgraph.json?id=${series}`;
       const data = await fetchJson(url);
-      // data.observations is an array of { date, value }
       const obs = (data.observations || []).filter(o => o.value !== '.');
       return obs.slice(-limit).map(o => parseFloat(o.value));
     } catch (e) {
@@ -140,16 +112,13 @@ async function fetchMacroSignals() {
   }
 
   const [dxy, cpi, rates] = await Promise.all([
-    fetchSeries('DTWEXBGS', 5),   // last 5 weekly DXY readings
-    fetchSeries('CPIAUCSL', 3),   // last 3 monthly CPI
-    fetchSeries('FEDFUNDS', 3),   // last 3 monthly Fed Funds rate
+    fetchSeries('DTWEXBGS', 5),
+    fetchSeries('CPIAUCSL', 3),
+    fetchSeries('FEDFUNDS', 3),
   ]);
 
-  // DXY falling: latest value lower than 4 periods ago
   const dxyFalling = dxy.length >= 2 && dxy[dxy.length - 1] < dxy[0];
-
-  // Macro bullish for commodities: CPI trending up AND rates trending down
-  const cpiRising   = cpi.length >= 2   && cpi[cpi.length - 1]   > cpi[0];
+  const cpiRising = cpi.length >= 2 && cpi[cpi.length - 1] > cpi[0];
   const ratesFalling = rates.length >= 2 && rates[rates.length - 1] < rates[0];
   const macroBullishCommodities = cpiRising && ratesFalling;
 
@@ -158,94 +127,75 @@ async function fetchMacroSignals() {
   return macroCache;
 }
 
-// ─── Technical Indicators ─────────────────────────────────────────────────
-
-function calculateRSI(closes) {
-  if (closes.length < 15) return 50;
-  
-  // Use the LAST 15 closes (not the first!)
-  const recentCloses = closes.slice(-15);
-  
-  let gains = 0, losses = 0;
-  for (let i = 1; i < recentCloses.length; i++) {
-    const diff = recentCloses[i] - recentCloses[i - 1];
-    if (diff > 0) gains += diff;
-    else losses -= diff;
-  }
-  
-  const avgGain = gains / 14;
-  const avgLoss = losses / 14;
-  
-  // Handle edge cases
-  if (avgLoss === 0) return avgGain === 0 ? 50 : 100;
-  if (avgGain === 0) return 0;
-  
-  const rs = avgGain / avgLoss;
-  return 100 - (100 / (1 + rs));
-}
+// Technical indicators using technicalindicators library
 
 function isOBVRising(closes, volumes, lookback = 5) {
-  if (closes.length < lookback + 1 || volumes.length < lookback + 1) return false;
-  const obv = [0];
-  for (let i = 1; i < closes.length; i++) {
-    if (closes[i] > closes[i - 1])      obv.push(obv[i - 1] + volumes[i]);
-    else if (closes[i] < closes[i - 1]) obv.push(obv[i - 1] - volumes[i]);
-    else                                 obv.push(obv[i - 1]);
-  }
-  const recent = obv.slice(-lookback).reduce((a, b) => a + b, 0) / lookback;
-  const prior  = obv.slice(-lookback * 2, -lookback).reduce((a, b) => a + b, 0) / lookback;
+  if (closes.length < lookback * 2 + 1 || volumes.length < lookback * 2 + 1) return false;
+  
+  const obvResult = OBV.calculate({ close: closes, volume: volumes });
+  if (obvResult.length < lookback * 2) return false;
+  
+  const recent = obvResult.slice(-lookback).reduce((a, b) => a + b, 0) / lookback;
+  const prior = obvResult.slice(-lookback * 2, -lookback).reduce((a, b) => a + b, 0) / lookback;
   return recent > prior;
 }
 
 function isPriceBelowVWAP(closes, highs, lows, volumes) {
-  let cumTPV = 0, cumVol = 0;
-  for (let i = 0; i < closes.length; i++) {
-    const typicalPrice = (highs[i] + lows[i] + closes[i]) / 3;
-    cumTPV += typicalPrice * volumes[i];
-    cumVol += volumes[i];
-  }
-  if (cumVol === 0) return false;
-  return closes[closes.length - 1] < cumTPV / cumVol;
+  if (closes.length === 0) return false;
+  
+  const vwapResult = VWAP.calculate({ high: highs, low: lows, close: closes, volume: volumes });
+  if (vwapResult.length === 0) return false;
+  
+  return closes[closes.length - 1] < vwapResult[vwapResult.length - 1];
 }
 
 function isBollingerSqueeze(closes, period = 14, lookback = 5) {
   if (closes.length < period + lookback) return false;
-  function bandWidth(slice) {
-    const mean = slice.reduce((a, b) => a + b, 0) / slice.length;
-    const stdDev = Math.sqrt(slice.reduce((a, b) => a + (b - mean) ** 2, 0) / slice.length);
-    return (stdDev * 2) / mean;
+
+  function getBandWidth(slice) {
+    const bbResult = BollingerBands.calculate({ period: period, values: slice, stdDev: 2 });
+    if (bbResult.length === 0) return null;
+    const lastBB = bbResult[bbResult.length - 1];
+    return (lastBB.upper - lastBB.lower) / lastBB.middle;
   }
-  const currentWidth = bandWidth(closes.slice(-period));
+
+  const currentWidth = getBandWidth(closes.slice(-period));
+  if (currentWidth === null) return false;
+  
   for (let i = 1; i <= lookback; i++) {
-    if (bandWidth(closes.slice(-period - i, -i)) <= currentWidth) return false;
+    const prevWidth = getBandWidth(closes.slice(-period - i, -i));
+    if (prevWidth === null || prevWidth <= currentWidth) return false;
   }
   return true;
 }
 
-function isMACDBullishCross(closes, fast = 12, slow = 26, signal = 9) {
-  if (closes.length < slow + signal) return false;
-  function ema(data, period) {
-    const k = 2 / (period + 1);
-    let result = data[0];
-    for (let i = 1; i < data.length; i++) result = data[i] * k + result * (1 - k);
-    return result;
-  }
-  const macdLine = [];
-  for (let i = closes.length - signal - 1; i < closes.length; i++) {
-    const slice = closes.slice(0, i + 1);
-    macdLine.push(ema(slice.slice(-slow), fast) - ema(slice.slice(-slow), slow));
-  }
-  const signalLine = macdLine.slice(-signal).reduce((a, b) => a + b, 0) / signal;
-  return macdLine[macdLine.length - 2] < signalLine && macdLine[macdLine.length - 1] >= signalLine;
+function isMACDBullishCross(closes) {
+  if (closes.length < 35) return false;
+  
+  const macdResult = MACD.calculate({
+    values: closes,
+    fastPeriod: 12,
+    slowPeriod: 26,
+    signalPeriod: 9,
+    SimpleMAOscillator: false,
+    SimpleMASignal: false
+  });
+  
+  if (macdResult.length < 2) return false;
+  
+  const prev = macdResult[macdResult.length - 2];
+  const curr = macdResult[macdResult.length - 1];
+  
+  return prev.MACD < prev.signal && curr.MACD >= curr.signal;
 }
-
-// ─── Scoring ──────────────────────────────────────────────────────────────
 
 function scoreAsset({ closes, highs, lows, volumes, isCommodity, macro }) {
   let score = 0;
   const signals = [];
 
-  const rsi = calculateRSI(closes);
+  const rsiResult = RSI.calculate({ values: closes, period: 14 });
+  const rsi = rsiResult.length > 0 ? rsiResult[rsiResult.length - 1] : 50;
+  
   if (rsi < RSI_OVERSOLD) {
     score += 1;
     signals.push(`RSI ${rsi.toFixed(1)} — oversold`);
@@ -271,7 +221,6 @@ function scoreAsset({ closes, highs, lows, volumes, isCommodity, macro }) {
     signals.push('Price below VWAP — below institutional fair value');
   }
 
-  // Macro layer — only meaningful for commodities (Gold, Silver, etc.)
   if (isCommodity && macro) {
     if (macro.dxyFalling) {
       score += 1;
@@ -286,43 +235,37 @@ function scoreAsset({ closes, highs, lows, volumes, isCommodity, macro }) {
   return { score, rsi, signals };
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────
-
 async function run() {
   try {
     console.log(`Scanning ${ALL_ASSETS.length} global assets via Yahoo Finance...`);
 
-    // Fetch macro signals once before the loop
     const macro = await fetchMacroSignals();
-
     const strongSignals = [];
-    const weakSignals   = [];
+    const weakSignals = [];
 
     for (let i = 0; i < ALL_ASSETS.length; i++) {
       const asset = ALL_ASSETS[i];
       try {
-        // 40 candles: enough for MACD (slow 26 + signal 9) + Bollinger lookback
         const data = await fetchJson(
           `https://query1.finance.yahoo.com/v8/finance/chart/${asset.symbol}?interval=1h&range=7d`
         );
         const result = data.chart?.result?.[0];
         if (!result) continue;
 
-        const rawCloses  = result.indicators.quote[0].close   || [];
-        const rawHighs   = result.indicators.quote[0].high    || [];
-        const rawLows    = result.indicators.quote[0].low     || [];
-        const rawVolumes = result.indicators.quote[0].volume  || [];
+        const rawCloses = result.indicators.quote[0].close || [];
+        const rawHighs = result.indicators.quote[0].high || [];
+        const rawLows = result.indicators.quote[0].low || [];
+        const rawVolumes = result.indicators.quote[0].volume || [];
 
-        // Strip null/undefined candles
         const valid = rawCloses.map((c, idx) => ({
           c, h: rawHighs[idx], l: rawLows[idx], v: rawVolumes[idx]
         })).filter(x => x.c != null && x.h != null && x.l != null && x.v != null);
 
         if (valid.length < 35) continue;
 
-        const closes  = valid.map(x => x.c);
-        const highs   = valid.map(x => x.h);
-        const lows    = valid.map(x => x.l);
+        const closes = valid.map(x => x.c);
+        const highs = valid.map(x => x.h);
+        const lows = valid.map(x => x.l);
         const volumes = valid.map(x => x.v);
 
         const { score, rsi, signals } = scoreAsset({
@@ -341,7 +284,7 @@ async function run() {
           console.log(`Weak   [${score}/10]: ${asset.name}`);
         }
       } catch (e) {
-        // Silently skip rate-limited / delisted assets
+        // Silently skip
       }
 
       await delay(50);
@@ -380,7 +323,7 @@ async function run() {
         <div style="font-family:Arial,sans-serif;color:#333;max-width:800px;margin:0 auto;border:1px solid #ddd;padding:20px;border-radius:8px;">
           <h2 style="color:#d32f2f;margin-top:0;">📉 Global Asset Alert: ${strongSignals.length} Strong Signals (score ≥ ${SCORE_EMAIL_THRESHOLD}/10)</h2>
           <p style="font-size:13px;color:#555;">
-            Multi-indicator composite scoring: RSI + OBV + VWAP + Bollinger squeeze + MACD crossover + macro (DXY/CPI/rates for commodities).<br>
+            Multi-indicator composite scoring using technicalindicators library: RSI + OBV + VWAP + Bollinger squeeze + MACD crossover + macro (DXY/CPI/rates for commodities).<br>
             Max score: 10 for commodities, 7 for equities. Only assets scoring ≥ ${SCORE_EMAIL_THRESHOLD} are emailed.
           </p>
           <table style="width:100%;border-collapse:collapse;font-size:13px;">
@@ -402,7 +345,7 @@ async function run() {
             CPI↑ + Rates↓: ${macro.macroBullishCommodities}
           </p>
           <p style="font-size:11px;color:#999;margin-top:16px;text-align:center;">
-            Generated by OpenClaw Trading Bot · Composite scoring v2
+            Generated by OpenClaw Trading Bot · Using technicalindicators library
           </p>
         </div>
       `.replace(/\n/g, ' ');
@@ -414,9 +357,9 @@ async function run() {
       fs.writeFileSync(tempBodyFile, htmlBody);
       const cmd = `${GOG_COMMAND} --to "${EMAIL_TO}" --subject "${subjectTag} Asset Alert: ${strongSignals.length} Strong Signals (score ≥ ${SCORE_EMAIL_THRESHOLD}/10)" --body-file "${tempBodyFile}"`;
       try {
-          execSync(cmd, { stdio: 'inherit' });
+        execSync(cmd, { stdio: 'inherit' });
       } finally {
-          if (fs.existsSync(tempBodyFile)) fs.unlinkSync(tempBodyFile);
+        if (fs.existsSync(tempBodyFile)) fs.unlinkSync(tempBodyFile);
       }
     } else {
       console.log('No strong signals this hour.');
